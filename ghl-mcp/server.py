@@ -236,6 +236,30 @@ async def get_conversations(
     return _truncate("\n".join(lines))
 
 
+@mcp.tool(annotations={"readOnlyHint": True})
+async def get_conversation_messages(
+    conversation_id: str = Field(description="Conversation ID (from get_conversations)"),
+    limit: int = Field(default=50, ge=1, le=100, description="Number of messages to fetch"),
+) -> str:
+    """Get the full SMS/email message thread for a conversation — shows back-and-forth texts.
+
+    Use get_conversations first to find the conversation ID for a contact.
+    Messages are returned in chronological order with sender direction (inbound/outbound).
+    """
+    data = await _get(f"/conversations/{conversation_id}/messages", {"limit": limit})
+    messages = data.get("messages", {}).get("messages", data.get("messages", []))
+    if not messages:
+        return f"No messages found in conversation {conversation_id}."
+    lines = [f"{len(messages)} message(s):\n"]
+    for m in messages:
+        direction = "→ OUT" if m.get("direction") == "outbound" else "← IN "
+        msg_type  = m.get("messageType") or m.get("type", "")
+        body      = m.get("body") or m.get("message", "")
+        date      = m.get("dateAdded", "—")
+        lines.append(f"[{date}] {direction} [{msg_type}] {body}")
+    return _truncate("\n".join(lines))
+
+
 @mcp.tool()
 async def send_sms(
     contact_id: str = Field(description="GHL contact ID to send SMS to"),
