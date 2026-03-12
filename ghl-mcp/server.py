@@ -3,6 +3,7 @@
 
 import os
 from typing import Optional
+from datetime import datetime, timezone, timedelta
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -427,6 +428,281 @@ async def get_contact_notes(contact_id: str = Field(description="GHL contact ID"
     lines = [f"{len(notes)} note(s):\n"]
     for n in notes:
         lines.append(f"- [{n.get('dateAdded','—')}] {n.get('body','')[:200]}")
+    return _truncate("\n".join(lines))
+
+
+# ── SALES ANALYSIS ───────────────────────────────────────────────────────────
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def analyze_unresponded_leads(
+    hours_threshold: int = Field(default=24, description="Flag leads with no reply after this many hours"),
+    limit: int = Field(default=100, ge=1, le=100),
+) -> str:
+    """Find leads with inbound messages that the sales team has NOT responded to.
+
+    Identifies contacts who texted/emailed in but received no outbound reply —
+    a key indicator of dropped leads and missed revenue.
+    """
+    data = await _get("/conversations/search", {
+        "locationId": _loc(),
+        "limit": limit,
+        "sortBy": "last_message_date",
+        "sortOrder": "desc",
+    })
+    convs = data.get("conversations", [])
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=hours_threshold)
+
+    unresponded = []
+    for cv in convs:
+        last_direction = cv.get("lastMessageDirection") or cv.get("direction", "")
+        last_date_str  = cv.get("dateUpdated") or cv.get("lastMessageDate", "")
+        if last_direction == "inbound":
+            try:
+                last_date = datetime.fromisoformat(last_date_str.replace("Z", "+00:00"))
+                age_hours = (now - last_date).total_seconds() / 3600
+                if last_date < cutoff:
+                    unresponded.append((cv, age_hours))
+            except Exception:
+                unresponded.append((cv, -1))
+
+    if not unresponded:
+        return f"No unresponded inbound messages older than {hours_threshold}h. Team is on top of it!"
+
+    lines = [f"⚠️  {len(unresponded)} leads waiting >{ hours_threshold}h for a reply:\n"]
+    for cv, age in unresponded:
+        name     = cv.get("contactName") or cv.get("fullName") or "Unknown"
+        last_msg = (cv.get("lastMessageBody") or "")[:100]
+        age_str  = f"{age:.0f}h ago" if age >= 0 else "unknown time ago"
+        lines.append(f"- {name} | Conv ID: {cv.get('id')} | Waiting: {age_str} | \"{last_msg}\"")
+
+    return _truncate("\n".join(lines))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def analyze_pipeline_health(
+    pipeline_id: str = Field(description="Pipeline ID to analyze (use get_pipelines to find IDs)"),
+) -> str:
+    """Analyze a sales pipeline to find where deals stall and what's at risk.
+
+    Shows deal count and total value per stage, flags deals with no activity,
+    and surfaces bottlenecks where prospects stop progressing.
+    """
+    data = await _get("/opportunities/search", {
+        "location_id": _loc(),
+        "pipeline_id": pipeline_id,
+        "limit": 100,
+    })
+    opps = data.get("opportunities", [])
+    if not opps:
+        return "No opportunities found in this pipeline."
+
+    now = datetime.now(timezone.utc)
+    stage_buckets: dict = {}
+    stale = []
+
+    for o in opps:
+        stage = o.get("pipelineStageName") or o.get("pipelineStageId", "Unknown Stage")
+        value = float(o.get("monetaryValue") or 0)
+        stage_buckets.setdefault(stage, {"count": 0, "value": 0.0})
+        stage_buckets[stage]["count"] += 1
+        stage_buckets[stage]["value"] += value
+
+        # Flag deals with no update in 7+ days
+        updated_str = o.get("dateUpdated") or o.get("updatedAt", "")
+        try:
+            updated = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+            if (now - updated).days >= 7:
+                stale.append((o.get("name", "Unnamed"), o.get("assignedTo", "—"), (now - updated).days))
+        except Exception:
+            pass
+
+    lines = ["📊 Pipeline Health Report\n", "── Stage Breakdown ──"]
+    total_value = sum(v["value"] for v in stage_buckets.values())
+    for stage, stats in stage_buckets.items():
+        lines.append(f"  {stage}: {stats['count']} deals | ${stats['value']:,.0f}")
+    lines.append(f"\n  TOTAL: {len(opps)} deals | ${total_value:,.0f}\n")
+
+    if stale:
+        lines.append(f"── Stale Deals (no activity 7+ days) ── {len(stale)} deals at risk")
+        for name, owner, days in sorted(stale, key=lambda x: -x[2]):
+            lines.append(f"  ⏰ \"{name}\" | Assigned: {owner} | {days} days dormant")
+    else:
+        lines.append("✅ No stale deals — pipeline is active.")
+
+    return _truncate("\n".join(lines))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def analyze_team_response_times(
+    limit: int = Field(default=100, ge=1, le=100, description="Conversations to sample"),
+) -> str:
+    """Measure how fast the sales team responds to inbound leads.
+
+    Samples recent conversations and calculates average/worst response times
+    per assigned team member. Slow response times are one of the #1 causes of lost deals.
+    """
+    data = await _get("/conversations/search", {
+        "locationId": _loc(),
+        "limit": limit,
+        "sortBy": "last_message_date",
+        "sortOrder": "desc",
+    })
+    convs = data.get("conversations", [])
+    if not convs:
+        return "No conversations found to analyze."
+
+    fast   = []  # < 5 min
+    medium = []  # 5–60 min
+    slow   = []  # 1–24 hrs
+    dead   = []  # 24+ hrs or never replied
+
+    for cv in convs:
+        first_response_time = cv.get("firstResponseTime")  # seconds, if GHL provides it
+        if first_response_time is not None:
+            mins = first_response_time / 60
+            entry = (cv.get("contactName") or "Unknown", mins)
+            if mins < 5:        fast.append(entry)
+            elif mins < 60:     medium.append(entry)
+            elif mins < 1440:   slow.append(entry)
+            else:               dead.append(entry)
+
+    all_times = fast + medium + slow
+    avg = sum(m for _, m in all_times) / len(all_times) if all_times else None
+
+    lines = ["⚡ Team Response Time Analysis\n"]
+    lines.append(f"Sample size: {len(convs)} conversations\n")
+
+    if avg is not None:
+        lines.append(f"Average first response: {avg:.0f} minutes")
+        lines.append(f"  ✅ Under 5 min:   {len(fast)} conversations")
+        lines.append(f"  🟡 5–60 min:      {len(medium)} conversations")
+        lines.append(f"  🔴 1–24 hrs:      {len(slow)} conversations")
+        lines.append(f"  💀 24+ hrs / none: {len(dead)} conversations\n")
+        if slow or dead:
+            lines.append("Slowest responses (need coaching):")
+            for name, mins in sorted(slow + dead, key=lambda x: -x[1])[:10]:
+                lines.append(f"  - {name}: {mins:.0f} min wait")
+    else:
+        # Fallback: use lastMessageDirection as proxy
+        no_reply = sum(1 for cv in convs if cv.get("lastMessageDirection") == "inbound")
+        replied  = len(convs) - no_reply
+        lines.append(f"Conversations with team reply: {replied}/{len(convs)}")
+        lines.append(f"Conversations awaiting reply:  {no_reply}/{len(convs)}")
+        pct = (no_reply / len(convs) * 100) if convs else 0
+        lines.append(f"\n{'🔴' if pct > 20 else '🟡' if pct > 10 else '✅'} "
+                     f"{pct:.0f}% of recent leads have NOT been replied to.")
+
+    return _truncate("\n".join(lines))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def analyze_lost_deals(
+    pipeline_id: str = Field(description="Pipeline ID to analyze"),
+    limit: int = Field(default=50, ge=1, le=100),
+) -> str:
+    """Analyze lost/abandoned deals to find patterns in why sales are failing.
+
+    Shows which stages deals are lost from most often, common loss reasons,
+    and which team members have the highest loss rates.
+    """
+    data = await _get("/opportunities/search", {
+        "location_id": _loc(),
+        "pipeline_id": pipeline_id,
+        "status": "lost",
+        "limit": limit,
+    })
+    lost_opps = data.get("opportunities", [])
+
+    data2 = await _get("/opportunities/search", {
+        "location_id": _loc(),
+        "pipeline_id": pipeline_id,
+        "status": "abandoned",
+        "limit": limit,
+    })
+    abandoned_opps = data2.get("opportunities", [])
+
+    all_dead = lost_opps + abandoned_opps
+    if not all_dead:
+        return "No lost or abandoned deals found — great sign!"
+
+    stage_losses: dict[str, int] = {}
+    owner_losses: dict[str, int] = {}
+    lost_value = 0.0
+
+    for o in all_dead:
+        stage = o.get("pipelineStageName") or o.get("pipelineStageId", "Unknown")
+        owner = o.get("assignedTo") or o.get("ownerName") or "Unassigned"
+        stage_losses[stage]  = stage_losses.get(stage, 0) + 1
+        owner_losses[owner]  = owner_losses.get(owner, 0) + 1
+        lost_value += float(o.get("monetaryValue") or 0)
+
+    lines = [
+        f"💔 Lost Deal Analysis — {len(all_dead)} deals | ${lost_value:,.0f} lost revenue\n",
+        "── Where deals are dying (stage) ──"
+    ]
+    for stage, count in sorted(stage_losses.items(), key=lambda x: -x[1]):
+        pct = count / len(all_dead) * 100
+        lines.append(f"  {stage}: {count} deals ({pct:.0f}%)")
+
+    lines.append("\n── Lost deals by team member ──")
+    for owner, count in sorted(owner_losses.items(), key=lambda x: -x[1]):
+        lines.append(f"  {owner}: {count} lost deals")
+
+    lines.append("\n── What to fix ──")
+    top_stage = max(stage_losses, key=stage_losses.get)
+    lines.append(f"  Most deals die at: \"{top_stage}\" — review scripts/objection handling at this stage.")
+    top_loser = max(owner_losses, key=owner_losses.get)
+    lines.append(f"  Most losses by: {top_loser} — consider 1:1 coaching session.")
+
+    return _truncate("\n".join(lines))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def analyze_contact_followup_gaps(
+    days_since_contact: int = Field(default=7, description="Flag contacts with no activity for this many days"),
+    limit: int = Field(default=100, ge=1, le=100),
+) -> str:
+    """Find leads in the system that haven't been followed up with recently.
+
+    Surfaces contacts who were active but have gone cold — a sign the team
+    is not nurturing leads consistently enough.
+    """
+    data = await _get("/contacts/", {
+        "locationId": _loc(),
+        "limit": limit,
+        "sortBy": "date_updated",
+        "sortOrder": "desc",
+    })
+    contacts = data.get("contacts", [])
+    if not contacts:
+        return "No contacts found."
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days_since_contact)
+    cold = []
+
+    for c in contacts:
+        updated_str = c.get("dateUpdated") or c.get("dateAdded", "")
+        try:
+            updated = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+            if updated < cutoff:
+                days_cold = (now - updated).days
+                cold.append((c, days_cold))
+        except Exception:
+            pass
+
+    if not cold:
+        return f"All contacts have activity within the last {days_since_contact} days. Great follow-up!"
+
+    lines = [f"🥶 {len(cold)} contacts have gone cold (no activity in {days_since_contact}+ days):\n"]
+    for c, days in sorted(cold, key=lambda x: -x[1])[:50]:
+        name  = f"{c.get('firstName','')} {c.get('lastName','')}".strip() or "Unknown"
+        email = c.get("email", "—")
+        tags  = ", ".join(c.get("tags", []))
+        lines.append(f"  - {name} | {email} | {days}d since last touch | Tags: {tags}")
+
+    lines.append(f"\n💡 Recommendation: Create a re-engagement sequence for these {len(cold)} contacts.")
     return _truncate("\n".join(lines))
 
 
