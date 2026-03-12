@@ -217,6 +217,48 @@ async def create_opportunity(
 # ── CONVERSATIONS ─────────────────────────────────────────────────────────────
 
 @mcp.tool(annotations={"readOnlyHint": True})
+async def scan_all_conversations(
+    limit: int = Field(default=100, ge=1, le=100, description="Conversations to fetch per page (max 100)"),
+    sort_by: str = Field(default="last_message_date", description="Sort by: last_message_date or created_date"),
+    sort_order: str = Field(default="desc", description="asc or desc"),
+    query: str = Field(default="", description="Optional keyword to filter conversations"),
+) -> str:
+    """Scan ALL conversations across the entire GoHighLevel account (not just one contact).
+
+    Returns a paginated list of every conversation with the last message preview.
+    Use get_conversation_messages with a conversation ID to read the full thread.
+    Call multiple times with increasing offsets to page through all history.
+    """
+    params: dict = {
+        "locationId": _loc(),
+        "limit": limit,
+        "sortBy": sort_by,
+        "sortOrder": sort_order,
+    }
+    if query:
+        params["query"] = query
+
+    data = await _get("/conversations/search", params)
+    convs = data.get("conversations", [])
+    total = data.get("total", "?")
+
+    if not convs:
+        return "No conversations found."
+
+    lines = [f"Total conversations in account: {total} | Showing {len(convs)}\n"]
+    for cv in convs:
+        contact_name = cv.get("contactName") or cv.get("fullName") or "Unknown"
+        last_msg = (cv.get("lastMessageBody") or "")[:120]
+        lines.append(
+            f"[{cv.get('dateUpdated','—')}] {contact_name} | "
+            f"Type: {cv.get('type','—')} | "
+            f"Conv ID: {cv.get('id')} | "
+            f"Last: {last_msg}"
+        )
+    return _truncate("\n".join(lines))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
 async def get_conversations(
     contact_id: str = Field(description="GHL contact ID to fetch conversations for"),
     limit: int = Field(default=10, ge=1, le=50),
