@@ -5,61 +5,47 @@ Uses gemini-2.0-flash-preview-image-generation which accepts both text and image
 input, allowing the reference product photo to be composited into ad layouts.
 """
 
-import base64
 import re
 import time
 from typing import Optional
 
+from google import genai
+from google.genai import types
 
-def analyze_product_image(client, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+
+def analyze_product_image(client: genai.Client, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
     """
     Send the product image to Gemini Vision to get a detailed description.
     This description is used to enrich the ad prompt generation.
     """
     from prompt_generator import build_product_analysis_prompt
-    import google.generativeai as genai
 
-    model = genai.GenerativeModel("gemini-1.5-pro")
-
-    image_part = {
-        "inline_data": {
-            "mime_type": mime_type,
-            "data": base64.b64encode(image_bytes).decode("utf-8"),
-        }
-    }
-
-    response = model.generate_content([
-        build_product_analysis_prompt(),
-        image_part
-    ])
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+    response = client.models.generate_content(
+        model="gemini-1.5-pro",
+        contents=[build_product_analysis_prompt(), image_part],
+    )
     return response.text.strip()
 
 
-def generate_ad_concepts(client, image_bytes: bytes, product_description: str, mime_type: str = "image/jpeg") -> str:
+def generate_ad_concepts(client: genai.Client, image_bytes: bytes, product_description: str, mime_type: str = "image/jpeg") -> str:
     """
     Send the product image + requirements to Gemini to generate all 10 concept prompts.
     Returns the raw text containing all concepts.
     """
     from prompt_generator import build_prompt_generation_request
-    import google.generativeai as genai
 
-    model = genai.GenerativeModel("gemini-1.5-pro")
-
-    image_part = {
-        "inline_data": {
-            "mime_type": mime_type,
-            "data": base64.b64encode(image_bytes).decode("utf-8"),
-        }
-    }
-
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
     full_prompt = build_prompt_generation_request(product_description)
-
-    response = model.generate_content([full_prompt, image_part])
+    response = client.models.generate_content(
+        model="gemini-1.5-pro",
+        contents=[full_prompt, image_part],
+    )
     return response.text.strip()
 
 
 def generate_ad_image(
-    client,
+    client: genai.Client,
     ad_prompt: str,
     reference_image_bytes: bytes,
     reference_mime_type: str = "image/jpeg",
@@ -71,16 +57,7 @@ def generate_ad_image(
 
     Returns image bytes (PNG) or None if generation failed.
     """
-    import google.generativeai as genai
-
-    model = genai.GenerativeModel("gemini-2.0-flash-preview-image-generation")
-
-    image_part = {
-        "inline_data": {
-            "mime_type": reference_mime_type,
-            "data": base64.b64encode(reference_image_bytes).decode("utf-8"),
-        }
-    }
+    image_part = types.Part.from_bytes(data=reference_image_bytes, mime_type=reference_mime_type)
 
     full_prompt = (
         "Using the reference product photo provided, generate a professional advertisement image. "
@@ -91,15 +68,18 @@ def generate_ad_image(
 
     for attempt in range(1, max_retries + 1):
         try:
-            response = model.generate_content(
-                [full_prompt, image_part],
-                generation_config={"response_modalities": ["image", "text"]},
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-preview-image-generation",
+                contents=[full_prompt, image_part],
+                config=types.GenerateContentConfig(
+                    response_modalities=["image", "text"]
+                ),
             )
 
             # Extract image from response parts
             for part in response.candidates[0].content.parts:
                 if hasattr(part, "inline_data") and part.inline_data:
-                    return base64.b64decode(part.inline_data.data)
+                    return part.inline_data.data
 
             print(f"    Warning: No image in response on attempt {attempt}")
 

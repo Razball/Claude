@@ -16,7 +16,7 @@ import sys
 import datetime
 import time
 
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 from drive_handler import (
@@ -58,7 +58,7 @@ def run():
         print("ERROR: GEMINI_API_KEY not set.")
         sys.exit(1)
 
-    genai.configure(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     run_date = datetime.date.today().strftime("%Y-%m-%d")
     print(f"\n{'='*60}")
@@ -86,12 +86,12 @@ def run():
 
     # ── Step 3: Analyze product image ─────────────────────────────────────────
     print("Analyzing product image with Gemini Vision...")
-    product_description = analyze_product_image(None, image_bytes, mime_type)
+    product_description = analyze_product_image(client, image_bytes, mime_type)
     print(f"Product description:\n{product_description}\n")
 
     # ── Step 4: Generate 10 concept prompts ───────────────────────────────────
     print("Generating 10 ad concepts with 3 formats each...")
-    raw_concepts = generate_ad_concepts(None, image_bytes, product_description, mime_type)
+    raw_concepts = generate_ad_concepts(client, image_bytes, product_description, mime_type)
 
     # Save raw output for debugging
     with open(f"concepts_{run_date}.txt", "w") as f:
@@ -133,7 +133,7 @@ def run():
             filename = f"concept_{concept_num:02d}_{fmt_key}_{size_label}.png"
             print(f"  Generating {fmt_key} ({size_label})...", end=" ", flush=True)
 
-            img_bytes = generate_ad_image(None, prompt, image_bytes, mime_type)
+            img_bytes = generate_ad_image(client, prompt, image_bytes, mime_type)
 
             if img_bytes:
                 upload_image_bytes(drive, img_bytes, filename, folder_id, mime_type="image/png")
