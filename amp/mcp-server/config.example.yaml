@@ -1,0 +1,13 @@
+storage:
+  backend: local
+  root: ../
+
+protocol_base:
+  path: ../protocol-base/protocol-base-v3.1.md
+
+clients:
+  ezlift:
+    module_path: ../client-modules/ezlift/client-module.md
+    vault_path: ../vault
+    subscription_status: active
+    tier: managed-os
